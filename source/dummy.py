@@ -5,14 +5,14 @@ import time
 from ultralytics import YOLO
 import torchreid
 
-
-# [TỐI ƯU 1] Bật chế độ Benchmark để PyTorch tự tìm thuật toán Conv nhanh nhất cho phần cứng
+# [TỐI ƯU 1] Benchmark
 torch.backends.cudnn.benchmark = True
-torch.cuda.reset_peak_memory_stats()
 
 # =========================
 # 1. Feature Extractor: OSNet
 # =========================
+
+"""
 class OSNetReID:
     def __init__(self, device="cuda"):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
@@ -21,17 +21,15 @@ class OSNetReID:
         self.model = torchreid.models.build_model(
             name="osnet_x1_0", num_classes=0, pretrained=True
         )
-        # Thứ tự chuẩn: to Device -> eval -> half
         self.model.to(self.device).eval()
         
         if self.device.type == 'cuda':
-            self.model.half()  # Ép FP16 để tăng tốc độ tính toán
+            self.model.half() 
 
         self.mean = np.array([0.485, 0.456, 0.406])
         self.std  = np.array([0.229, 0.224, 0.225])
 
     def _preprocess(self, img_bgr):
-        # Hàm này xử lý 1 ảnh lẻ (giữ lại để dùng nếu cần)
         img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         img = cv2.resize(img, (128, 256))
         img = img.astype(np.float32) / 255.0
@@ -41,13 +39,7 @@ class OSNetReID:
         return tensor
 
     def extract_batch(self, img_list):
-        """
-        [TỐI ƯU MỚI] Xử lý một lúc nhiều ảnh (Batch)
-        """
-        if len(img_list) == 0:
-            return []
-
-        # 1. Preprocess tất cả ảnh trong list (trên CPU)
+        if len(img_list) == 0: return []
         processed_imgs = []
         for img_bgr in img_list:
             img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
@@ -57,21 +49,15 @@ class OSNetReID:
             img = img.transpose(2, 0, 1)
             processed_imgs.append(torch.from_numpy(img))
 
-        # 2. Stack lại thành 1 Tensor duy nhất: [N, 3, 256, 128]
-        batch_tensor = torch.stack(processed_imgs)
-        
-        # 3. Đưa vào GPU 1 lần duy nhất
-        batch_tensor = batch_tensor.to(self.device)
+        batch_tensor = torch.stack(processed_imgs).to(self.device)
         
         if self.device.type == 'cuda':
             batch_tensor = batch_tensor.half()
 
-        # 4. Inference
         with torch.no_grad():
             features = self.model(batch_tensor)
             features = torch.nn.functional.normalize(features, p=2, dim=1)
         
-        # 5. Trả về numpy array
         return features.cpu().float().numpy()
 
 def cosine_distance(a, b):
@@ -93,28 +79,21 @@ def compute_iou(box1, box2):
 
     iou = interArea / float(box1Area + box2Area - interArea)
     return iou
+
 # =========================
-# 2. Persistent Tracker 
-# =========================
-# =========================
-# 2. Persistent Tracker 
+# 2. Persistent Tracker (ĐÃ FIX: DÙNG IOU)
 # =========================
 class PersistentTracker:
     def __init__(self):
         self.target_emb = None      
         self.state = "IDLE"         
         self.lost_counter = 0
-        self.COASTING_LIMIT = 60    
+        self.COASTING_LIMIT = 90    
         
         # --- CẤU HÌNH ---
-        self.STRICT_REID_THRESH = 0.38 
-        self.IOU_THRESHOLD = 0.1
+        self.STRICT_REID_THRESH = 0.40 
+        self.IOU_THRESHOLD = 0.1       # Chỉ cần chạm nhau 10% là bắt
         self.MAX_SCALE_CHANGE = 1.8 
-
-        # [MỚI] QUẢN LÝ LỊCH SỬ ĐỘ TIN CẬY
-        self.score_history = []     # Lưu 10 giá trị distance gần nhất
-        self.MAX_HISTORY = 10
-        self.SPIKE_THRESHOLD = 2.0  # Nếu sai khác tăng gấp đôi trung bình -> BỎ
 
         # Kalman Filter
         self.kf = cv2.KalmanFilter(4, 2)
@@ -126,7 +105,6 @@ class PersistentTracker:
         self.target_emb = embedding.copy()
         self.state = "TRACKING"
         self.lost_counter = 0
-        self.score_history = [0.1] # Giả sử lúc đầu rất giống (dist thấp)
         
         x1, y1, x2, y2 = bbox
         self.last_w = x2 - x1
@@ -147,8 +125,10 @@ class PersistentTracker:
         
         ratio = area_new / (area_old + 1e-6)
         
+        # Chống to lên quá nhanh
         if ratio > self.MAX_SCALE_CHANGE: return False 
 
+        # Chống nhỏ đi quá nhanh (trừ khi tâm vẫn trùng khớp)
         if ratio < (1.0 / self.MAX_SCALE_CHANGE):
             cx_new = (current_bbox[0] + current_bbox[2]) / 2
             cy_new = (current_bbox[1] + current_bbox[3]) / 2
@@ -173,10 +153,12 @@ class PersistentTracker:
         # 1. PREDICT
         pred_bbox = None
         pred_cx, pred_cy = 0, 0
+        
         if self.state in ["TRACKING", "LOST"]:
             prediction = self.kf.predict()
             pred_cx, pred_cy = prediction[0, 0], prediction[1, 0]
             
+            # [FIX] Đóng băng kích thước Ghost Box
             w, h = self.last_w, self.last_h
             p_x1 = int(pred_cx - w / 2)
             p_y1 = int(pred_cy - h / 2)
@@ -197,7 +179,6 @@ class PersistentTracker:
         if self.state == "WAITING":
             if len(candidates) > 0:
                 dist, idx, bbox = candidates[0]
-                # Reset
                 x1, y1, x2, y2 = bbox
                 cx, cy = (x1+x2)/2, (y1+y2)/2
                 self.kf.statePost = np.array([[cx], [cy], [0], [0]], np.float32)
@@ -205,7 +186,6 @@ class PersistentTracker:
                 self.last_h = y2 - y1
                 self.state = "TRACKING"
                 self.lost_counter = 0
-                self.score_history = [dist] # Reset history
                 return bbox, dist, idx
             else:
                 return None, 0.0, -1
@@ -214,33 +194,22 @@ class PersistentTracker:
             best_idx = None
             best_score = 999.0
 
-            # Tính điểm trung bình lịch sử (Baseline)
-            if len(self.score_history) > 0:
-                avg_score = sum(self.score_history) / len(self.score_history)
-            else:
-                avg_score = 0.2
-
             for dist, idx, bbox in candidates:
-                # --- [MỚI] KIỂM TRA ĐỘT BIẾN REID ---
-                # Nếu dist hiện tại (ví dụ 0.38) tệ hơn nhiều so với trung bình (ví dụ 0.12)
-                # -> Khả năng cao là người khác đè lên -> BỎ QUA
-                # Chỉ cho phép tệ đi một chút (cộng thêm biên độ an toàn 0.15)
-                dynamic_limit = avg_score + 0.15
-                
-                if dist > dynamic_limit:
-                    continue # Bỏ qua người này vì "trông lạ lạ", nghi là người khác
-
-                # Scale Check
+                # Check Scale trước
                 if not self.check_scale_consistency(bbox, pred_bbox):
                     continue 
 
-                # IoU & Distance Check
+                # ========================================================
+                # [FIX QUAN TRỌNG] GỌI HÀM COMPUTE_IOU Ở ĐÂY
+                # ========================================================
+                # Ưu tiên 1: Nếu Box mới chạm vào Ghost Box (IoU > 0.1) -> LẤY LUÔN
                 iou = compute_iou(pred_bbox, bbox)
                 if iou > self.IOU_THRESHOLD:
                     best_idx = idx
                     best_score = dist
                     break 
                 
+                # Ưu tiên 2: Nếu không chạm nhưng tâm ở gần (Fallback)
                 x1, y1, x2, y2 = bbox
                 meas_cx, meas_cy = (x1+x2)/2, (y1+y2)/2
                 jump_dist = np.sqrt((meas_cx - pred_cx)**2 + (meas_cy - pred_cy)**2)
@@ -255,11 +224,7 @@ class PersistentTracker:
                 self.lost_counter = 0
                 best_bbox = all_bboxes[best_idx]
                 
-                # Cập nhật lịch sử điểm số
-                self.score_history.append(best_score)
-                if len(self.score_history) > self.MAX_HISTORY:
-                    self.score_history.pop(0)
-
+                # Update Size mượt
                 new_w = best_bbox[2] - best_bbox[0]
                 new_h = best_bbox[3] - best_bbox[1]
                 self.last_w = 0.7 * self.last_w + 0.3 * new_w
@@ -294,22 +259,19 @@ class MouseSelector:
             print(f"[Mouse] Clicked at {self.point}")
 
 # =========================
-# 4. Main Program (Đã tối ưu Batch)
+# 4. Main Program
 # =========================
 def main():
-    video_path = r"D:\WORKSPACE\Notebook\yolo_person\video\testvideo.mp4" 
+    video_path = r"D:\WORKSPACE\Notebook\yolo_person\video\testvideo3.mp4" 
     yolo_path = r"D:\WORKSPACE\Notebook\yolo_person\model\best3.pt"
-    using_cam = 1 # Set to 0 to use video file
+    using_cam = 0 
     
-    # [TỐI ƯU 2] Giữ nguyên resize vì đây là cách tăng FPS tốt nhất
     MAX_WIDTH = 960 
-    
     device_str = 0 if torch.cuda.is_available() else 'cpu'
     print(f"[INFO] Running YOLO on: {device_str}")
     
     print("Loading Models...")
     model = YOLO(yolo_path)
-    
     reid = OSNetReID(device="cuda" if torch.cuda.is_available() else "cpu")
     tracker = PersistentTracker()
     mouse = MouseSelector()
@@ -318,65 +280,46 @@ def main():
     cv2.namedWindow("Smart ReID Tracker", cv2.WINDOW_NORMAL)
     cv2.setMouseCallback("Smart ReID Tracker", mouse.callback)
 
-    prev_time = 0 
-
     while True:
         curr_time = time.time()
-        fps = 1 / (curr_time - prev_time) if (curr_time - prev_time) > 0 else 0
-        prev_time = curr_time
-
         ret, frame = cap.read()
         if not ret: break
         
-        if (using_cam):
-            frame = cv2.flip(frame, 1)  # mirror
+        if (using_cam): frame = cv2.flip(frame, 1)
 
-        # 1. Resize Frame
         h, w = frame.shape[:2]
         if w > MAX_WIDTH:
             scale = MAX_WIDTH / w
             new_h = int(h * scale)
             frame = cv2.resize(frame, (MAX_WIDTH, new_h))
         
-        # 2. YOLO Detect
         results = model.predict(frame, conf=0.5, verbose=False, classes=[0], device=device_str)
         
         boxes = []
         embeddings = []
         confs = []
-        
-        # [TỐI ƯU 3] Gom tất cả crop lại để xử lý 1 lần (Batch Inference)
-        crops_to_extract = []
-        meta_data_temp = [] # Lưu tạm để map lại sau khi extract
+        crops_to_extract = [] 
+        meta_data_temp = []
 
         if results[0].boxes:
             for box in results[0].boxes:
                 xyxy = box.xyxy.cpu().numpy()[0].astype(int)
                 conf_val = float(box.conf[0].item())
-                
                 x1, y1, x2, y2 = xyxy
                 crop = frame[y1:y2, x1:x2]
                 if crop.size == 0: continue
                 
-                # Thay vì extract ngay, ta gom lại
                 crops_to_extract.append(crop)
                 meta_data_temp.append((x1, y1, x2, y2, conf_val))
 
-            # Nếu có crop nào thì extract một thể
             if len(crops_to_extract) > 0:
-                # Chạy Batch Extract
                 batch_embeddings = reid.extract_batch(crops_to_extract)
-                
-                # Bung ra lại các list
                 for i in range(len(batch_embeddings)):
                     x1, y1, x2, y2, conf_val = meta_data_temp[i]
-                    emb = batch_embeddings[i]
-                    
                     boxes.append([x1, y1, x2, y2])
-                    embeddings.append(emb)
+                    embeddings.append(batch_embeddings[i])
                     confs.append(conf_val)
 
-        # 3. Logic Hiển thị & Tương tác (GIỮ NGUYÊN LOGIC CŨ)
         if tracker.state == "IDLE":
             cv2.putText(frame, "CLICK TO SELECT TARGET", (20, 80), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
@@ -412,9 +355,6 @@ def main():
                     cv2.putText(frame, "OCCLUDED", (x1, y1 - 10), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-        cv2.putText(frame, f"FPS: {int(fps)}", (20, 40), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
         cv2.imshow("Smart ReID Tracker", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
@@ -424,4 +364,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    print("peak VRAM (MB):", torch.cuda.max_memory_allocated()/1024/1024)
+"""
